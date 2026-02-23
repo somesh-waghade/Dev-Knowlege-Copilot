@@ -58,6 +58,11 @@ npm start
 
 ### POST /api/v1/query
 
+The query endpoint uses a **two-stage retrieval pipeline**:
+1. **Hybrid Search**: Combines BM25 and Vector search for high recall.
+2. **Re-ranking**: Uses a Cross-Encoder (`TinyBERT`) to ensure high precision.
+3. **Factuality Guard**: A second-pass LLM self-check to prevent hallucinations.
+
 ```json
 // Request
 {
@@ -89,8 +94,8 @@ npm start
 # Week 1 tests
 pytest backend/tests/test_week1.py -v
 
-# Week 2 tests (Citations, Ingestion, Logging)
-pytest backend/tests/test_week2.py -v
+# Week 5 tests (Re-ranking, Scoring, Factuality)
+pytest backend/tests/test_week5.py -v
 ```
 
 ---
@@ -118,9 +123,13 @@ docker run -p 8000:8000 --env-file .env dev-copilot:latest
 │   │   ├── chunker.py        ← Structural Code Chunking (.py, .js)
 │   │   └── embedder.py       ← BGE-small-en-v1.5 embeddings
 │   ├── retrieval/
-│   │   └── vector_store.py   ← FAISS IndexFlatIP
+│   │   ├── vector_store.py   ← FAISS IndexFlatIP
+│   │   ├── hybrid.py        ← BM25 + Vector Fusion
+│   │   └── reranker.py       ← Cross-Encoder Re-ranking
+│   ├── scoring/
+│   │   └── engine.py         ← Centralized Confidence Engine
 │   ├── generation/
-│   │   └── llm.py            ← Prompt builder + citations logic
+│   │   └── llm.py            ← LLM + Factuality Guard
 │   └── main.py               ← App entry point
 ├── mobile/
 │   ├── app/search.tsx        ← Premium Results UI
@@ -139,9 +148,9 @@ docker run -p 8000:8000 --env-file .env dev-copilot:latest
 |------|-------|
 | ✅ 1 | Basic RAG — chunking, embeddings, FAISS, citations |
 | ✅ 2 | Advanced Citations + Mobile UI + Code Ingestion |
-| 🚧 3 | Hybrid search (BM25 + Vector) |
-| 📅 4 | Latency metrics + request logging |
-| 📅 5 | Confidence scoring + hallucination heuristics |
+| ✅ 3 | Hybrid search (BM25 + Vector) |
+| ✅ 4 | Latency metrics + request logging |
+| ✅ 5 | Confidence scoring + re-ranking + Factuality Guard |
 | 📅 6 | Redis caching + benchmarks |
 | 📅 7 | Load testing (50 concurrent users) |
 | 📅 8 | Deploy to Render + Expo APK build |

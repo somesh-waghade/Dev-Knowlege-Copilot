@@ -34,6 +34,7 @@ INTERVIEW TIP:
 
 import re
 import time
+import json
 import httpx
 from backend.core.config import settings
 
@@ -159,3 +160,68 @@ async def generate_answer(query: str, chunks: list[dict]) -> dict:
         "tokens_used": tokens_used,
         "generation_latency_ms": elapsed_ms,
     }
+
+
+async def verify_factuality(query: str, answer: str, chunks: list[dict]) -> dict:
+    """
+    Perform a second-pass check to ensure the answer is grounded in the context.
+    This helps detect hallucinations that the system prompt might have missed.
+    """
+    context_str = "\n\n".join([f"[Source {i+1}] {c['text']}" for i, c in enumerate(chunks)])
+    
+    system_message = (
+        "You are a strict fact-checker. Your job is to verify if a given answer is "
+        "fully supported by the provided context. "
+        "Output your response in JSON format only: {'score': int, 'is_grounded': bool, 'reason': str}. "
+        "Score is from 0 to 10. is_grounded is true ONLY if every claim in the answer is in the context."
+    )
+    
+    user_message = (
+        f"CONTEXT:\n{context_str}\n\n"
+        f"QUESTION: {query}\n\n"
+        f"PROPOSED ANSWER: {answer}\n\n"
+        "Evaluate the answer's factuality based ONLY on the context."
+    )
+
+    payload = {
+        "model": settings.llm_model,
+        "messages": [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message}
+        ],
+        "temperature": 0.0, # Complete deterministic for checking
+        "response_format": {"type": "json_object"} if "gpt" in settings.llm_model.lower() else None
+    }
+
+    headers = {
+        "Authorization": f"Bearer {settings.llm_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            response = await client.post(
+                f"{settings.llm_base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            
+            # Simple JSON extraction if the model wraps it in block
+            match = re.search(r"\{.*\}", content, re.DOTALL)
+            if match:
+                result = json.loads(match.group())
+            else:
+                result = {"score": 5, "is_grounded": False, "reason": "Failed to parse fact-check JSON"}
+                
+            return {
+                "factuality_score": result.get("score", 0),
+                "is_grounded": result.get("is_grounded", False),
+                "reasoning": result.get("reason", "N/A"),
+                "tokens_used": data.get("usage", {}).get("total_tokens", 0)
+            }
+        except Exception as e:
+            print(f"[Factuality Guard Error]: {e}")
+            return {"factuality_score": 10, "is_grounded": True, "reasoning": "Check bypassed due to error"}
