@@ -27,7 +27,8 @@ INTERVIEW TIP:
 """
 
 import time
-from fastapi import APIRouter, HTTPException
+import asyncio
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from backend.retrieval.vector_store import vector_store
 from backend.retrieval.hybrid import hybrid_search
@@ -43,7 +44,11 @@ from backend.core.config import settings
 from backend.retrieval.reranker import reranker
 from backend.scoring.engine import compute_confidence
 from backend.cache.cache_manager import cache_manager
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
+# We'll initialize this in main.py but need the object here for decorators
+limiter = Limiter(key_func=get_remote_address)
 router = APIRouter()
 
 
@@ -117,52 +122,79 @@ class MetricsResponse(BaseModel):
 @router.get("/health")
 async def health_check():
     """
-    Lightweight liveness probe.
-    Returns immediately — no DB or index access.
-    Used by Docker health checks and load balancers.
+    Readiness probe.
+    Verifies that the database and vector store are accessible.
     """
-    return {
+    health = {
         "status": "ok",
-        "indexed_vectors": vector_store._next_id,
-        "env": settings.app_env,
+        "checks": {
+            "database": "down",
+            "vector_store": "down"
+        }
     }
+    
+    # Check Database
+    try:
+        from backend.db.models import get_connection
+        conn = get_connection()
+        conn.execute("SELECT 1")
+        conn.close()
+        health["checks"]["database"] = "up"
+    except Exception as e:
+        health["status"] = "error"
+        health["error_db"] = str(e)
+
+    # Check Vector Store
+    try:
+        if vector_store._index is not None:
+            health["checks"]["vector_store"] = "up"
+            health["indexed_vectors"] = vector_store._index.ntotal
+        else:
+            health["status"] = "error"
+            health["checks"]["vector_store"] = "not_loaded"
+    except Exception as e:
+        health["status"] = "error"
+        health["error_vs"] = str(e)
+
+    if health["status"] == "error":
+        raise HTTPException(status_code=503, detail=health)
+        
+    return health
 
 
 @router.post("/query", response_model=QueryResponse)
-async def query_documents(request: QueryRequest):
+@limiter.limit("20/minute")
+async def query_documents(body: QueryRequest, request: Request):
     """
-    Main RAG endpoint with robust error logging.
+    Main RAG endpoint with robust error logging and rate limiting.
     """
     wall_start = time.perf_counter()
     metrics = {}
 
+    loop = asyncio.get_running_loop()
+
     try:
-        if not request.query.strip():
-            raise HTTPException(status_code=400, detail="Query cannot be empty.")
+        if not body.query.strip():
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-        if vector_store._next_id == 0:
-            raise HTTPException(
-                status_code=503,
-                detail="No documents indexed yet. Run ingest_docs.py first."
-            )
-
-        # ── Step 0: Check Cache (Week 6) ────────────────────────────────────────
-        cached_response = cache_manager.get(request.query, request.top_k)
+        # ── Step 0: Cache Lookup (Week 6) ────────────────────────────────────────
+        cached_response = cache_manager.get(body.query, body.top_k)
         if cached_response:
-            # We wrap the dict back into a QueryResponse
             return QueryResponse(**cached_response)
 
         # ── Step 1: Hybrid search (Week 3/4) ─────────────────────────────────────
-        search_data = hybrid_search(
-            request.query, 
-            top_k=request.top_k, 
-            search_mode=request.search_mode
+        search_data = await loop.run_in_executor(
+            None, 
+            hybrid_search, 
+            body.query, 
+            body.top_k, 
+            body.search_mode
         )
         search_results = search_data["results"]
         metrics = search_data["metrics"]
 
         # Filter by minimum similarity score
-        filtered = [r for r in search_results if r["score"] >= request.min_score]
+        filtered = [r for r in search_results if r["score"] >= body.min_score]
         if not filtered:
             return QueryResponse(
                 answer="I could not find relevant information for your query.",
@@ -174,7 +206,7 @@ async def query_documents(request: QueryRequest):
 
         # ── Step 2: Fetch metadata from SQLite ───────────────────────────────────
         faiss_ids = [r["faiss_id"] for r in filtered]
-        raw_chunks = get_chunks_by_faiss_ids(faiss_ids)
+        raw_chunks = await loop.run_in_executor(None, get_chunks_by_faiss_ids, faiss_ids)
 
         if not raw_chunks:
              # This should not happen if search_results were found
@@ -188,7 +220,13 @@ async def query_documents(request: QueryRequest):
         # ── Step 2.5: Re-ranking (Week 5) ─────────────────────────────────────────
         rerank_start = time.perf_counter()
         # We rerank all chunks from Step 2 to find the best top_n
-        reranked = reranker.rerank(request.query, chunks, top_n=request.top_n_rerank)
+        reranked = await loop.run_in_executor(
+            None, 
+            reranker.rerank, 
+            body.query, 
+            chunks, 
+            body.top_n_rerank
+        )
         metrics["rerank_ms"] = int((time.perf_counter() - rerank_start) * 1000)
         
         # New confidence based on Cross-Encoder scores
@@ -200,8 +238,8 @@ async def query_documents(request: QueryRequest):
         # ── Step 2.6: Confidence Guard ───────────────────────────────────────────
         # If user requested a minimum confidence and we are below it
         CONF_LEVELS = {"low": 0, "medium": 1, "high": 2}
-        if request.min_confidence:
-            target = CONF_LEVELS.get(request.min_confidence.lower(), 0)
+        if body.min_confidence:
+            target = CONF_LEVELS.get(body.min_confidence.lower(), 0)
             actual = CONF_LEVELS.get(confidence, 0)
             if actual < target:
                 return QueryResponse(
@@ -215,7 +253,7 @@ async def query_documents(request: QueryRequest):
         chunks = reranked  # Use the re-ranked chunks for generation
 
         # ── Step 3: Generate answer (Optional) ──────────────────────────────────
-        if request.bypass_llm:
+        if body.bypass_llm:
             llm_result = {
                 "answer": "[Bypass Mode] Retrieval only. No answer generated.",
                 "tokens_used": 0
@@ -225,23 +263,23 @@ async def query_documents(request: QueryRequest):
             fact_check = {"is_grounded": True, "reasoning": "Bypass mode"}
         else:
             llm_start = time.perf_counter()
-            llm_result = await generate_answer(request.query, chunks)
+            llm_result = await generate_answer(body.query, chunks)
             metrics["llm_ms"] = int((time.perf_counter() - llm_start) * 1000)
 
             # ── Step 3.5: Factuality Check (Week 5) ──────────────────────────────
             # Perform a second-pass check to detect hallucinations
             fact_start = time.perf_counter()
-            fact_check = await verify_factuality(request.query, llm_result["answer"], chunks)
+            fact_check = await verify_factuality(body.query, llm_result["answer"], chunks)
             metrics["fact_ms"] = int((time.perf_counter() - fact_start) * 1000)
             
             # If the check fails, we downgrade confidence
             if not fact_check["is_grounded"]:
                 confidence = "low"
-                print(f"[Factuality Guard] Hallucination detected for query: {request.query}")
+                print(f"[Factuality Guard] Hallucination detected for query: {body.query}")
                 print(f"Reasoning: {fact_check['reasoning']}")
 
         # ── Step 4: Build response ───────────────────────────────────────────────
-        if request.bypass_llm:
+        if body.bypass_llm:
             # In bypass mode, we return all top chunks as citations
             used_indices = list(range(1, len(chunks) + 1))
         else:
@@ -270,7 +308,7 @@ async def query_documents(request: QueryRequest):
         # ── Step 5: Log query for analytics (Week 2/4) ───────────────────────────
         try:
             insert_query_log(
-                query=request.query,
+                query=body.query,
                 answer=llm_result.get("answer") or "N/A",
                 confidence=confidence,
                 latency_ms=total_latency_ms,
@@ -293,7 +331,7 @@ async def query_documents(request: QueryRequest):
         )
 
         # ── Step 6: Store in Cache (Week 6) ─────────────────────────────────────
-        cache_manager.set(request.query, request.top_k, response.model_dump())
+        cache_manager.set(body.query, body.top_k, response.model_dump())
 
         return response
 

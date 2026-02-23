@@ -8,6 +8,7 @@ Cross-Encoders are slower but MUCH more accurate at judging
 the relationship between a specific query and a specific chunk.
 """
 
+import threading
 from sentence_transformers import CrossEncoder
 from backend.core.config import settings
 
@@ -19,12 +20,15 @@ class Reranker:
     def __init__(self, model_name="cross-encoder/ms-marco-TinyBERT-L-2-v2"):
         self.model_name = model_name
         self._model = None
+        self._lock = threading.Lock()
 
     @property
     def model(self):
         if self._model is None:
-            print(f"[Reranker] Loading {self.model_name}...")
-            self._model = CrossEncoder(self.model_name)
+            with self._lock:
+                if self._model is None:  # Double-check
+                    print(f"[Reranker] Loading {self.model_name}...")
+                    self._model = CrossEncoder(self.model_name)
         return self._model
 
     def rerank(self, query: str, chunks: list[dict], top_n: int = 5) -> list[dict]:

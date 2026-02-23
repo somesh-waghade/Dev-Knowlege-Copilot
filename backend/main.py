@@ -22,9 +22,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api.routes import router
+from backend.api.routes import router, limiter
 from backend.db.models import init_db
 from backend.retrieval.vector_store import vector_store
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 
 @asynccontextmanager
@@ -61,6 +63,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── Rate Limiting ─────────────────────────────────────────────────────────────
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
@@ -83,4 +89,5 @@ app.include_router(router, prefix="/api/v1")
 # Or:    uvicorn backend.main:app --reload --port 8000
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
+    # reload=False to avoid "paging file too small" errors on Windows/RAM-limited envs
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=False)
