@@ -65,7 +65,7 @@ def init_db() -> None:
         )
     """)
 
-    # ── query_logs table (Week 2) ──────────────────────────────────────────
+    # ── query_logs table (Week 2/5) ──────────────────────────────────────────
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS query_logs (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,16 +75,20 @@ def init_db() -> None:
             latency_ms  INTEGER,
             embed_ms    INTEGER,
             retrieval_ms INTEGER,
+            rerank_ms   INTEGER DEFAULT 0,
+            fact_ms     INTEGER DEFAULT 0,
             llm_ms      INTEGER,
             tokens_used INTEGER,
             timestamp   TEXT DEFAULT (datetime('now'))
         )
     """)
 
-    # ── Migration for existing Week 2 databases ──
+    # ── Migration for existing databases ──
     try:
         cursor.execute("ALTER TABLE query_logs ADD COLUMN embed_ms INTEGER")
         cursor.execute("ALTER TABLE query_logs ADD COLUMN retrieval_ms INTEGER")
+        cursor.execute("ALTER TABLE query_logs ADD COLUMN rerank_ms INTEGER DEFAULT 0")
+        cursor.execute("ALTER TABLE query_logs ADD COLUMN fact_ms INTEGER DEFAULT 0")
         cursor.execute("ALTER TABLE query_logs ADD COLUMN llm_ms INTEGER")
     except sqlite3.OperationalError:
         # Columns likely already exist
@@ -190,18 +194,19 @@ def get_all_documents() -> list[dict]:
 
 
 def insert_query_log(query: str, answer: str, confidence: str,
-                      latency_ms: int, tokens_used: int,
-                      embed_ms: int = 0, retrieval_ms: int = 0, llm_ms: int = 0) -> None:
+                       latency_ms: int, tokens_used: int,
+                       embed_ms: int = 0, retrieval_ms: int = 0, 
+                       rerank_ms: int = 0, fact_ms: int = 0, llm_ms: int = 0) -> None:
     """Store a record of a RAG query and its performance metrics."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO query_logs
            (query, answer, confidence, latency_ms, tokens_used, 
-            embed_ms, retrieval_ms, llm_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            embed_ms, retrieval_ms, rerank_ms, fact_ms, llm_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (query, answer, confidence, latency_ms, tokens_used, 
-         embed_ms, retrieval_ms, llm_ms),
+         embed_ms, retrieval_ms, rerank_ms, fact_ms, llm_ms),
     )
     conn.commit()
     conn.close()
@@ -233,6 +238,8 @@ def get_latency_metrics() -> dict:
             AVG(latency_ms) as avg_total,
             AVG(embed_ms) as avg_embed,
             AVG(retrieval_ms) as avg_retrieval,
+            AVG(rerank_ms) as avg_rerank,
+            AVG(fact_ms) as avg_fact,
             AVG(llm_ms) as avg_llm
         FROM query_logs
     """)
@@ -254,12 +261,16 @@ def get_latency_metrics() -> dict:
             "total": get_percentile("latency_ms", 0.50),
             "embed": get_percentile("embed_ms", 0.50),
             "retrieval": get_percentile("retrieval_ms", 0.50),
+            "rerank": get_percentile("rerank_ms", 0.50),
+            "fact": get_percentile("fact_ms", 0.50),
             "llm": get_percentile("llm_ms", 0.50),
         },
         "p95": {
             "total": get_percentile("latency_ms", 0.95),
             "embed": get_percentile("embed_ms", 0.95),
             "retrieval": get_percentile("retrieval_ms", 0.95),
+            "rerank": get_percentile("rerank_ms", 0.95),
+            "fact": get_percentile("fact_ms", 0.95),
             "llm": get_percentile("llm_ms", 0.95),
         }
     }

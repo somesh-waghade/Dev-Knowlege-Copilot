@@ -29,17 +29,19 @@ INTERVIEW TIP:
 import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-
 from backend.retrieval.vector_store import vector_store
 from backend.retrieval.hybrid import hybrid_search
-from backend.generation.llm import generate_answer
+from backend.generation.llm import generate_answer, verify_factuality
 from backend.db.models import (
     get_chunks_by_faiss_ids, 
     get_all_documents, 
     insert_query_log,
     get_latency_metrics
 )
+
 from backend.core.config import settings
+from backend.retrieval.reranker import reranker
+from backend.scoring.engine import compute_confidence
 
 router = APIRouter()
 
@@ -52,6 +54,9 @@ class QueryRequest(BaseModel):
     top_k: int = settings.top_k         # Caller can override retrieval count
     min_score: float = 0.0              # Filter out very low relevance results
     search_mode: str = "hybrid"         # "hybrid" | "vector" | "bm25"
+    min_confidence: str | None = None   # "high" | "medium" | "low"
+    top_n_rerank: int = 5               # How many to keep after reranking
+
 
 
 class Citation(BaseModel):
@@ -92,6 +97,8 @@ class LatencyBreakdown(BaseModel):
     embed: int
     retrieval: int
     llm: int
+    rerank: int = 0
+    fact: int = 0
 
 
 class MetricsResponse(BaseModel):
@@ -101,32 +108,6 @@ class MetricsResponse(BaseModel):
     avg: LatencyBreakdown
     p50: LatencyBreakdown
     p95: LatencyBreakdown
-
-
-# ── Confidence scoring helper ─────────────────────────────────────────────────
-
-def compute_confidence(scores: list[float], mode: str) -> str:
-    """
-    Rule-based confidence based on search mode and scores.
-    
-    - Vector mode: Cosine similarity [0, 1]
-    - Hybrid/BM25: RRF scores or BM25 raw scores (unbounded or small)
-    """
-    if not scores:
-        return "low"
-        
-    top_score = max(scores)
-    
-    if mode == "vector":
-        if top_score > 0.80: return "high"
-        if top_score > 0.60: return "medium"
-        return "low"
-    else:
-        # For Hybrid (RRF) and BM25, we use relative thresholds 
-        # for Week 3. Week 5 will introduce a more robust approach.
-        if top_score > 0.03: return "high"
-        if top_score > 0.01: return "medium"
-        return "low"
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -195,10 +176,52 @@ async def query_documents(request: QueryRequest):
         chunks_map = {c["faiss_id"]: c for c in raw_chunks}
         chunks = [chunks_map[fid] for fid in faiss_ids if fid in chunks_map]
 
+        # ── Step 2.5: Re-ranking (Week 5) ─────────────────────────────────────────
+        rerank_start = time.perf_counter()
+        # We rerank all chunks from Step 2 to find the best top_n
+        reranked = reranker.rerank(request.query, chunks, top_n=request.top_n_rerank)
+        metrics["rerank_ms"] = int((time.perf_counter() - rerank_start) * 1000)
+        
+        # New confidence based on Cross-Encoder scores
+        confidence = compute_confidence(
+            [c.get("rerank_score", -10.0) for c in reranked], 
+            mode="rerank"
+        )
+
+        # ── Step 2.6: Confidence Guard ───────────────────────────────────────────
+        # If user requested a minimum confidence and we are below it
+        CONF_LEVELS = {"low": 0, "medium": 1, "high": 2}
+        if request.min_confidence:
+            target = CONF_LEVELS.get(request.min_confidence.lower(), 0)
+            actual = CONF_LEVELS.get(confidence, 0)
+            if actual < target:
+                return QueryResponse(
+                    answer=f"I don't have enough confidence ({confidence}) to answer this accurately based on your requirements.",
+                    citations=[],
+                    confidence=confidence,
+                    latency_ms=int((time.perf_counter() - wall_start) * 1000),
+                    tokens_used=0
+                )
+
+        chunks = reranked  # Use the re-ranked chunks for generation
+
         # ── Step 3: Generate answer ──────────────────────────────────────────────
         llm_start = time.perf_counter()
         llm_result = await generate_answer(request.query, chunks)
         metrics["llm_ms"] = int((time.perf_counter() - llm_start) * 1000)
+
+        # ── Step 3.5: Factuality Check (Week 5) ──────────────────────────────────
+        # Perform a second-pass check to detect hallucinations
+        fact_start = time.perf_counter()
+        fact_check = await verify_factuality(request.query, llm_result["answer"], chunks)
+        metrics["fact_ms"] = int((time.perf_counter() - fact_start) * 1000)
+        
+        # If the check fails, we downgrade confidence
+        if not fact_check["is_grounded"]:
+            confidence = "low"
+            # Optional: Append a subtle warning or log it
+            print(f"[Factuality Guard] Hallucination detected for query: {request.query}")
+            print(f"Reasoning: {fact_check['reasoning']}")
 
         # ── Step 4: Build response ───────────────────────────────────────────────
         from backend.generation.llm import extract_citation_indices
@@ -221,10 +244,6 @@ async def query_documents(request: QueryRequest):
         citations = [all_citations[i-1] for i in used_indices if 0 < i <= len(all_citations)]
 
         total_latency_ms = int((time.perf_counter() - wall_start) * 1000)
-        confidence = compute_confidence(
-            [r["score"] for r in filtered], 
-            mode=request.search_mode
-        )
 
 
         # ── Step 5: Log query for analytics (Week 2/4) ───────────────────────────
@@ -237,6 +256,8 @@ async def query_documents(request: QueryRequest):
                 tokens_used=llm_result.get("tokens_used", 0),
                 embed_ms=metrics.get("embed_ms", 0),
                 retrieval_ms=metrics.get("retrieval_ms", 0),
+                rerank_ms=metrics.get("rerank_ms", 0),
+                fact_ms=metrics.get("fact_ms", 0),
                 llm_ms=metrics.get("llm_ms", 0),
             )
         except Exception as log_err:
@@ -282,7 +303,9 @@ async def get_performance_metrics():
             total=int(summary["avg_total"] or 0),
             embed=int(summary["avg_embed"] or 0),
             retrieval=int(summary["avg_retrieval"] or 0),
-            llm=int(summary["avg_llm"] or 0)
+            llm=int(summary["avg_llm"] or 0),
+            rerank=int(summary["avg_rerank"] or 0),
+            fact=int(summary["avg_fact"] or 0)
         ),
         p50=LatencyBreakdown(**data["p50"]),
         p95=LatencyBreakdown(**data["p95"])
