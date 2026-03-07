@@ -26,23 +26,25 @@ INTERVIEW TIP:
    is ~30MB — trivially small."
 """
 
+import threading
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from backend.core.config import settings
 
 # ── Singleton model ─────────────────────────────────────────────────────────
-# Model is loaded once at module import time.
-# Subsequent calls to embed() reuse the already-loaded model (no re-download).
 _model: SentenceTransformer | None = None
+_model_lock = threading.Lock()
 
 
 def _get_model() -> SentenceTransformer:
-    """Lazy-load the embedding model (downloaded once, cached locally)."""
+    """Lazy-load the embedding model with thread safety."""
     global _model
     if _model is None:
-        print(f"[Embedder] Loading model: {settings.embed_model}")
-        _model = SentenceTransformer(settings.embed_model)
-        print(f"[Embedder] Model loaded. Output dimension: {settings.embed_dimension}")
+        with _model_lock:
+            if _model is None:  # Double-checked locking
+                print(f"[Embedder] Loading model: {settings.embed_model}")
+                _model = SentenceTransformer(settings.embed_model)
+                print(f"[Embedder] Model loaded. Output dimension: {settings.embed_dimension}")
     return _model
 
 
