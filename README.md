@@ -2,6 +2,16 @@
 
 A production-grade Retrieval-Augmented Generation (RAG) system built to index technical documentation and provide precise, grounded answers with citations and confidence scores.
 
+## Screenshots
+
+<p align="center">
+  <img src="mobile/assets/screenshots/screenshot2.jpg" width="200" alt="Search Screen" />
+  &nbsp;&nbsp;&nbsp;
+  <img src="mobile/assets/screenshots/screenshot1.jpg" width="200" alt="Knowledge Base - Browse" />
+  &nbsp;&nbsp;&nbsp;
+  <img src="mobile/assets/screenshots/screenshot3.jpg" width="200" alt="Knowledge Base - Upload" />
+</p>
+
 ## Features
 
 *   **Hybrid Search**: Combines Dense Vector Search (Cohere/FAISS) and Sparse Keyword Search (BM25) with Reciprocal Rank Fusion (RRF) for optimal document retrieval.
